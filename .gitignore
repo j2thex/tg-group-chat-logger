@@ -22,7 +22,8 @@ var/
 
 # Environment variables
 .env
-
+bot.log
+bot.error.log
 # Project specific
 chat_history/
 
