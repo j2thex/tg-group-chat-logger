@@ -82,6 +82,18 @@ def sanitize_name(name):
         return "unnamed_chat"
     return re.sub(r'[^\w_ -]', '', name).strip().replace(' ', '_')
 
+def extract_links(text):
+    """Extract URLs from text using regex"""
+    if not text:
+        return []
+    # This pattern matches URLs more comprehensively
+    url_pattern = re.compile(
+        r'(?:https?://)?'  # Optional http(s)://
+        r'(?:(?:[\w-]+\.)+[a-zA-Z]{2,})'  # domain name
+        r'(?:/[^"\s<>]*)?'  # Optional path
+    )
+    return url_pattern.findall(text)
+
 def format_message(timestamp, username, content, message_time):
     """Format message with live/backfill flag"""
     is_live = message_time > BOT_START_TIME
@@ -138,16 +150,18 @@ async def process_media(message, chat_dir):
             
             if await download_file(file_obj, str(file_path)):
                 logger.info(f"Saved {media_type} to {file_path}")
-                return f"[MEDIA] [{message.date.strftime('%Y-%m-%d %H:%M:%S')}] " \
+                message_time = datetime.fromtimestamp(message.date.timestamp())
+                flag = "[LIVE]" if message_time > BOT_START_TIME else "[BACKFILL]"
+                return f"{flag} [{message.date.strftime('%Y-%m-%d %H:%M:%S')}] " \
                        f"{message.from_user.username or message.from_user.first_name}: " \
-                       f"Sent {media_type} ({file_name}) - Caption: {caption}\n"
+                       f"Sent file: {file_name} - Caption: {caption}\n"
     
     except Exception as e:
         logger.error(f"Error processing media: {e}", exc_info=True)
     
     return None
 
-async def process_message(message, existing, is_backfill=False):
+async def process_message(message, existing, chat_dir=None, is_backfill=False):
     """Process a single message and return formatted line if valid"""
     if message and (message.text or message.caption):
         msg_id = get_message_id(message)
@@ -160,7 +174,30 @@ async def process_message(message, existing, is_backfill=False):
             content = message.text or message.caption
             
             message_time = datetime.fromtimestamp(message.date.timestamp())
-            line = format_message(timestamp, username, content, message_time)
+            is_live = message_time > BOT_START_TIME
+            flag = "[LIVE]" if is_live else "[BACKFILL]"
+            
+            line = f"{flag} [{timestamp}] {username}: {content}\n"
+            
+            # Check for links in the message
+            if content and chat_dir:
+                links = extract_links(content)
+                if links:
+                    links_path = chat_dir / "links.txt"
+                    links_existing = set()
+                    if links_path.exists():
+                        with open(links_path, "r", encoding='utf-8') as f:
+                            links_existing = set(f.readlines())
+                    
+                    link_lines = []
+                    for link in links:
+                        link_line = f"{flag} [{timestamp}] {username}: {link}\n"
+                        if link_line not in links_existing:
+                            link_lines.append(link_line)
+                    
+                    if link_lines:
+                        with open(links_path, "a", encoding='utf-8') as f:
+                            f.writelines(link_lines)
             
             if line not in existing:
                 return line
@@ -253,7 +290,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Handle text messages
         if message.text:
-            line = await process_message(message, existing)
+            line = await process_message(message, existing, chat_dir)
             if line:
                 with open(file_path, "a", encoding='utf-8') as f:
                     f.write(line)
@@ -332,7 +369,8 @@ async def backfill_history(chat: Chat, context: ContextTypes.DEFAULT_TYPE):
                 offset = update.update_id + 1
                 
                 if update.message and update.message.chat.id == chat.id:
-                    line = await process_message(update.message, existing)
+                    # Pass is_backfill=True here
+                    line = await process_message(update.message, existing, chat_dir, is_backfill=True)
                     if line:
                         new_messages.append(line)
                         total_fetched += 1
