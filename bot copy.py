@@ -13,7 +13,6 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from openai import OpenAI
 
 # Initialize logging first
 logging.basicConfig(
@@ -39,12 +38,10 @@ MAX_HISTORY = 1000  # Max messages to backfill
 PROCESSED_MESSAGES = set()
 BOT_START_TIME = datetime.now()
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-
 def get_bot_token():
     """Get bot token from environment with detailed error handling"""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
+    
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN not found in environment variables")
         logger.info(f"Current working directory: {os.getcwd()}")
@@ -70,25 +67,6 @@ def format_message(timestamp, username, content, message_time):
 def get_message_id(message):
     """Create a unique identifier for a message"""
     return f"{message.chat.id}_{message.message_id}"
-
-async def process_message(message, existing, is_backfill=False):
-    """Process a single message and return formatted line if valid"""
-    if message and (message.text or message.caption):
-        msg_id = get_message_id(message)
-        if msg_id not in PROCESSED_MESSAGES:
-            PROCESSED_MESSAGES.add(msg_id)
-            
-            timestamp = message.date.strftime("%Y-%m-%d %H:%M:%S")
-            user = message.from_user
-            username = user.username or user.first_name or "Unknown"
-            content = message.text or message.caption
-            
-            message_time = datetime.fromtimestamp(message.date.timestamp())
-            line = format_message(timestamp, username, content, message_time)
-            
-            if line not in existing:
-                return line
-    return None
 
 async def get_recent_messages(chat_title: str, num_messages: int = 5) -> list:
     """Retrieve the last n messages from the chat history"""
@@ -117,43 +95,139 @@ async def get_recent_messages(chat_title: str, num_messages: int = 5) -> list:
         logger.error(f"Error getting recent messages: {e}", exc_info=True)
         return []
 
-async def analyze_with_gpt(messages: list) -> str:
-    """Analyze conversation using GPT"""
+async def process_message(message, existing, is_backfill=False):
+    """Process a single message and return formatted line if valid"""
+    if message and (message.text or message.caption):
+        msg_id = get_message_id(message)
+        if msg_id not in PROCESSED_MESSAGES:
+            PROCESSED_MESSAGES.add(msg_id)
+            
+            timestamp = message.date.strftime("%Y-%m-%d %H:%M:%S")
+            user = message.from_user
+            username = user.username or user.first_name or "Unknown"
+            content = message.text or message.caption
+            
+            message_time = datetime.fromtimestamp(message.date.timestamp())
+            line = format_message(timestamp, username, content, message_time)
+            
+            if line not in existing:
+                return line
+    return None
+
+def analyze_conversation(messages: list) -> str:
+    """Analyze the conversation and generate a contextual response"""
     try:
         if not messages:
             return "There aren't any recent messages to analyze."
+            
+        # Count messages per user
+        user_messages = {}
+        topics = set()
+        question_count = 0
+        
+        for msg in messages:
+            user = msg['username']
+            user_messages[user] = user_messages.get(user, 0) + 1
+            
+            content = msg['content'].lower()
+            
+            if '?' in content:
+                question_count += 1
+                
+            words = [word for word in re.findall(r'\w+', content) if len(word) > 4]
+            topics.update(words)
+        
+        response_parts = []
+        
+        participants = len(user_messages)
+        if participants > 1:
+            response_parts.append(f"I see a conversation between {participants} people!")
+        
+        if question_count > 0:
+            response_parts.append(f"There {'was' if question_count == 1 else 'were'} {question_count} question{'s' if question_count > 1 else ''} asked.")
+        
+        if user_messages:
+            most_active = max(user_messages.items(), key=lambda x: x[1])
+            if most_active[1] > 1:
+                response_parts.append(f"{most_active[0]} has been quite active!")
+        
+        relevant_topics = [topic for topic in topics if len(topic) > 4][:2]
+        if relevant_topics:
+            topics_str = " and ".join(relevant_topics)
+            response_parts.append(f"The conversation seems to be about {topics_str}.")
+        
+        if not response_parts:
+            return "I can see the recent messages, but I'm not quite sure what to make of them yet!"
+            
+        return " ".join(response_parts)
+        
+    except Exception as e:
+        logger.error(f"Error analyzing conversation: {e}", exc_info=True)
+        return "I had some trouble analyzing the recent messages."
 
-        # Format messages for GPT
-        formatted_chat = "\n".join([
-            f"{msg['username']}: {msg['content']}" 
-            for msg in messages
-        ])
+async def handle_react_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /react command"""
+    try:
+        chat = update.effective_chat
+        if not chat:
+            logger.error("No chat found in update")
+            return
+            
+        if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
+            await update.message.reply_text("This command only works in group chats!")
+            return
+            
+        logger.info(f"Processing /react command in chat: {chat.title}")
+        
+        recent_messages = await get_recent_messages(chat.title)
+        response = analyze_conversation(recent_messages)
+        await update.message.reply_text(response)
+        
+    except Exception as e:
+        logger.error(f"React command error: {e}", exc_info=True)
+        await update.message.reply_text("Sorry, I had trouble analyzing the recent messages.")
 
-        # Create the prompt
-        prompt = f"""Here are the last few messages from a group chat:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new messages"""
+    try:
+        chat = update.effective_chat
+        message = update.effective_message
+        
+        if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
+            return
 
-{formatted_chat}
+        chat_title = sanitize_name(chat.title)
+        chat_dir = DATA_DIR / chat_title
+        chat_dir.mkdir(parents=True, exist_ok=True)
+        file_path = chat_dir / "messages.txt"
 
-Very short summary what is going on here, 20 words max, and then roast them
-"""
+        existing = set()
+        if file_path.exists():
+            with open(file_path, "r", encoding='utf-8') as f:
+                existing = set(f.readlines())
 
-        # Call GPT API
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a chat participant who provides brief, insightful observations about conversations and roasts participants."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=150,
-            temperature=0.7
-        )
-
-        # Extract and return the response
-        return response.choices[0].message.content.strip()
+        line = await process_message(message, existing)
+        if line:
+            with open(file_path, "a", encoding='utf-8') as f:
+                f.write(line)
+            
+            logger.info(f"Saved new message from {chat.title}")
 
     except Exception as e:
-        logger.error(f"GPT analysis error: {e}", exc_info=True)
-        return "I had some trouble analyzing the recent messages."
+        logger.error(f"Message error: {e}", exc_info=True)
+
+async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle being added to a group"""
+    try:
+        chat = update.effective_chat
+        new_status = update.my_chat_member.new_chat_member.status
+        
+        if new_status == "member" and chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+            logger.info(f"Joined new group: {chat.title}")
+            await backfill_history(chat, context)
+
+    except Exception as e:
+        logger.error(f"New chat error: {e}", exc_info=True)
 
 async def backfill_history(chat: Chat, context: ContextTypes.DEFAULT_TYPE):
     """Backfill previous messages for a chat"""
@@ -198,73 +272,6 @@ async def backfill_history(chat: Chat, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Backfill error: {e}", exc_info=True)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle new messages"""
-    try:
-        chat = update.effective_chat
-        message = update.effective_message
-        
-        if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
-            return
-
-        chat_title = sanitize_name(chat.title)
-        chat_dir = DATA_DIR / chat_title
-        chat_dir.mkdir(parents=True, exist_ok=True)
-        file_path = chat_dir / "messages.txt"
-
-        existing = set()
-        if file_path.exists():
-            with open(file_path, "r", encoding='utf-8') as f:
-                existing = set(f.readlines())
-
-        line = await process_message(message, existing)
-        if line:
-            with open(file_path, "a", encoding='utf-8') as f:
-                f.write(line)
-            
-            logger.info(f"Saved new message from {chat.title}")
-
-    except Exception as e:
-        logger.error(f"Message error: {e}", exc_info=True)
-
-async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle being added to a group"""
-    try:
-        chat = update.effective_chat
-        new_status = update.my_chat_member.new_chat_member.status
-        
-        if new_status == "member" and chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
-            logger.info(f"Joined new group: {chat.title}")
-            await backfill_history(chat, context)
-
-    except Exception as e:
-        logger.error(f"New chat error: {e}", exc_info=True)
-
-async def handle_react_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the /react command"""
-    try:
-        chat = update.effective_chat
-        if not chat:
-            logger.error("No chat found in update")
-            return
-            
-        if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
-            await update.message.reply_text("This command only works in group chats!")
-            return
-            
-        logger.info(f"Processing /react command in chat: {chat.title}")
-        
-        # Get recent messages
-        recent_messages = await get_recent_messages(chat.title)
-        
-        # Get GPT analysis
-        response = await analyze_with_gpt(recent_messages)
-        await update.message.reply_text(response)
-        
-    except Exception as e:
-        logger.error(f"React command error: {e}", exc_info=True)
-        await update.message.reply_text("Sorry, I had trouble analyzing the recent messages.")
-
 async def post_init(application: Application):
     """Backfill history for all known groups on startup"""
     try:
@@ -284,10 +291,6 @@ async def post_init(application: Application):
 def main():
     """Start the bot"""
     try:
-        # Verify OpenAI API key is present
-        if not os.getenv('OPENAI_API_KEY'):
-            raise ValueError("Missing OPENAI_API_KEY in environment variables")
-
         # Get bot token and create directories
         token = get_bot_token()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -307,15 +310,8 @@ def main():
         application.add_handler(CommandHandler("react", handle_react_command))
 
         logger.info("Bot initialized, starting polling...")
-        
-        # Run the bot with proper shutdown handling
-        application.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
-        
-    except KeyboardInterrupt:
-        logger.info("Bot stopping...")
-        if 'application' in locals():
-            application.stop()
-        
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         raise
