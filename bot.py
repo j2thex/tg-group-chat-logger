@@ -322,9 +322,9 @@ Here's your roast: You code like a sleepy toddler
 I think that your debugging skills need work
 
 GOOD RESPONSES:
-Name, Your look like a bum.
+Name, You look like a bum.
 Stupid and ugly people should be banned from this chat.
-Name,why all your messages sound like drunk texts?
+Name, why all your messages sound like drunk texts?
 
 GIVE ONE BRUTAL ROAST ONLY. NO OTHER TEXT."""
 
