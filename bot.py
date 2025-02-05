@@ -1,31 +1,6 @@
 import os
 import re
 import logging
-from functools import partial
-from typing import Any
-class SensitiveFormatter(logging.Formatter):
-    """Custom formatter that redacts sensitive information"""
-    
-    def __init__(self, fmt: str, *args: Any, **kwargs: Any):
-        super().__init__(fmt, *args, **kwargs)
-        self.sensitive_patterns = [
-            (re.compile(r'bot\d+:[A-Za-z0-9-_]{35}'), 'BOT_TOKEN_REDACTED'),
-            (re.compile(r'sk-[A-Za-z0-9]{48}'), 'OPENAI_KEY_REDACTED'),
-        ]
-
-    def format(self, record: logging.LogRecord) -> str:
-        if isinstance(record.msg, str):
-            msg = record.msg
-            for pattern, replacement in self.sensitive_patterns:
-                msg = pattern.sub(replacement, msg)
-            record.msg = msg
-        return super().format(record)
-
-# Initialize logging with sensitive data protection
-log_formatter = SensitiveFormatter(
-    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -40,26 +15,37 @@ from telegram.ext import (
 )
 from openai import OpenAI
 
-# File handler
+# Initialize logging with sensitive data protection
+class SensitiveFormatter(logging.Formatter):
+    """Custom formatter that redacts sensitive information"""
+    def __init__(self, fmt: str):
+        super().__init__(fmt)
+        self.sensitive_patterns = [
+            (re.compile(r'bot\d+:[A-Za-z0-9-_]{35}'), 'BOT_TOKEN_REDACTED'),
+            (re.compile(r'sk-[A-Za-z0-9]{48}'), 'OPENAI_KEY_REDACTED'),
+        ]
+
+    def format(self, record):
+        if isinstance(record.msg, str):
+            msg = record.msg
+            for pattern, replacement in self.sensitive_patterns:
+                msg = pattern.sub(replacement, msg)
+            record.msg = msg
+        return super().format(record)
+
+# Set up logging
+log_formatter = SensitiveFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 file_handler = logging.FileHandler("bot.log")
 file_handler.setFormatter(log_formatter)
-
-# Console handler
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
 
-# Configure root logger
 logging.basicConfig(
     level=logging.INFO,
     handlers=[file_handler, console_handler]
 )
 
 logger = logging.getLogger(__name__)
-
-httpx_logger = logging.getLogger('httpx')
-for handler in httpx_logger.handlers:
-    handler.setFormatter(log_formatter)
-
 
 # Set up base directory and load environment variables
 BASE_DIR = Path(__file__).resolve().parent
@@ -106,6 +92,61 @@ def get_message_id(message):
     """Create a unique identifier for a message"""
     return f"{message.chat.id}_{message.message_id}"
 
+async def download_file(file, destination):
+    """Download a file from Telegram"""
+    try:
+        await file.download_to_drive(destination)
+        return True
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}", exc_info=True)
+        return False
+
+async def process_media(message, chat_dir):
+    """Process and save media files from a message"""
+    try:
+        file_obj = None
+        file_name = None
+        media_type = None
+        caption = message.caption or "No caption"
+
+        if message.photo:
+            media_type = 'photo'
+            file_obj = await message.photo[-1].get_file()
+            file_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        elif message.document:
+            media_type = 'document'
+            file_obj = await message.document.get_file()
+            original_name = message.document.file_name
+            file_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{original_name}"
+        elif message.video:
+            media_type = 'video'
+            file_obj = await message.video.get_file()
+            ext = os.path.splitext(message.video.file_name)[1] if message.video.file_name else '.mp4'
+            file_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+        elif message.audio:
+            media_type = 'audio'
+            file_obj = await message.audio.get_file()
+            ext = os.path.splitext(message.audio.file_name)[1] if message.audio.file_name else '.mp3'
+            file_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+        elif message.voice:
+            media_type = 'voice'
+            file_obj = await message.voice.get_file()
+            file_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.ogg"
+        
+        if file_obj and file_name:
+            file_path = chat_dir / file_name
+            
+            if await download_file(file_obj, str(file_path)):
+                logger.info(f"Saved {media_type} to {file_path}")
+                return f"[MEDIA] [{message.date.strftime('%Y-%m-%d %H:%M:%S')}] " \
+                       f"{message.from_user.username or message.from_user.first_name}: " \
+                       f"Sent {media_type} ({file_name}) - Caption: {caption}\n"
+    
+    except Exception as e:
+        logger.error(f"Error processing media: {e}", exc_info=True)
+    
+    return None
+
 async def process_message(message, existing, is_backfill=False):
     """Process a single message and return formatted line if valid"""
     if message and (message.text or message.caption):
@@ -139,7 +180,7 @@ async def get_recent_messages(chat_title: str, num_messages: int = 5) -> list:
         with open(file_path, "r", encoding='utf-8') as f:
             lines = f.readlines()
             for line in lines[-num_messages:]:
-                match = re.match(r'\[(LIVE|BACKFILL)\] \[(.*?)\] (.*?): (.*)', line.strip())
+                match = re.match(r'\[(LIVE|BACKFILL|MEDIA)\] \[(.*?)\] (.*?): (.*)', line.strip())
                 if match:
                     _, timestamp, username, content = match.groups()
                     recent_messages.append({
@@ -158,37 +199,112 @@ async def analyze_with_gpt(messages: list) -> str:
         if not messages:
             return "There aren't any recent messages to analyze."
 
-        # Format messages for GPT
         formatted_chat = "\n".join([
             f"{msg['username']}: {msg['content']}" 
             for msg in messages
         ])
 
-        # Create the prompt
         prompt = f"""Here are the last few messages from a group chat:
 
 {formatted_chat}
 
-Very short summary what is going on here, 20 words max, and then roast them
+Please provide a brief, friendly analysis of this conversation. Include:
+- What are people discussing?
+- Any notable interactions or patterns?
+- The overall tone or mood of the conversation
+
+Keep your response concise and conversational, as if you're another member of the chat.
 """
 
-        # Call GPT API
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a chat participant who provides brief, insightful observations about conversations and roasts participants."},
+                {"role": "system", "content": "You are a friendly chat participant who provides brief, insightful observations about conversations."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=150,
             temperature=0.7
         )
 
-        # Extract and return the response
         return response.choices[0].message.content.strip()
 
     except Exception as e:
         logger.error(f"GPT analysis error: {e}", exc_info=True)
         return "I had some trouble analyzing the recent messages."
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new messages including media"""
+    try:
+        chat = update.effective_chat
+        message = update.effective_message
+        
+        if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
+            return
+
+        chat_title = sanitize_name(chat.title)
+        chat_dir = DATA_DIR / chat_title
+        chat_dir.mkdir(parents=True, exist_ok=True)
+        file_path = chat_dir / "messages.txt"
+
+        existing = set()
+        if file_path.exists():
+            with open(file_path, "r", encoding='utf-8') as f:
+                existing = set(f.readlines())
+
+        # Handle text messages
+        if message.text:
+            line = await process_message(message, existing)
+            if line:
+                with open(file_path, "a", encoding='utf-8') as f:
+                    f.write(line)
+                logger.info(f"Saved text message from {chat.title}")
+        
+        # Handle media messages
+        if any([message.photo, message.document, message.video, 
+                message.audio, message.voice]):
+            media_line = await process_media(message, chat_dir)
+            if media_line:
+                with open(file_path, "a", encoding='utf-8') as f:
+                    f.write(media_line)
+                logger.info(f"Saved media message from {chat.title}")
+
+    except Exception as e:
+        logger.error(f"Message handling error: {e}", exc_info=True)
+
+async def handle_react_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /react command"""
+    try:
+        chat = update.effective_chat
+        if not chat:
+            logger.error("No chat found in update")
+            return
+            
+        if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
+            await update.message.reply_text("This command only works in group chats!")
+            return
+            
+        logger.info(f"Processing /react command in chat: {chat.title}")
+        
+        recent_messages = await get_recent_messages(chat.title)
+        response = await analyze_with_gpt(recent_messages)
+        await update.message.reply_text(response)
+        
+    except Exception as e:
+        logger.error(f"React command error: {e}", exc_info=True)
+        await update.message.reply_text("Sorry, I had trouble analyzing the recent messages.")
+
+async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle being added to a group"""
+    try:
+        chat = update.effective_chat
+        new_status = update.my_chat_member.new_chat_member.status
+        
+        if new_status == "member" and chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+            logger.info(f"Joined new group: {chat.title}")
+            await backfill_history(chat, context)
+
+    except Exception as e:
+        logger.error(f"New chat error: {e}", exc_info=True)
 
 async def backfill_history(chat: Chat, context: ContextTypes.DEFAULT_TYPE):
     """Backfill previous messages for a chat"""
@@ -232,73 +348,6 @@ async def backfill_history(chat: Chat, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Backfill error: {e}", exc_info=True)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle new messages"""
-    try:
-        chat = update.effective_chat
-        message = update.effective_message
-        
-        if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
-            return
-
-        chat_title = sanitize_name(chat.title)
-        chat_dir = DATA_DIR / chat_title
-        chat_dir.mkdir(parents=True, exist_ok=True)
-        file_path = chat_dir / "messages.txt"
-
-        existing = set()
-        if file_path.exists():
-            with open(file_path, "r", encoding='utf-8') as f:
-                existing = set(f.readlines())
-
-        line = await process_message(message, existing)
-        if line:
-            with open(file_path, "a", encoding='utf-8') as f:
-                f.write(line)
-            
-            logger.info(f"Saved new message from {chat.title}")
-
-    except Exception as e:
-        logger.error(f"Message error: {e}", exc_info=True)
-
-async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle being added to a group"""
-    try:
-        chat = update.effective_chat
-        new_status = update.my_chat_member.new_chat_member.status
-        
-        if new_status == "member" and chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
-            logger.info(f"Joined new group: {chat.title}")
-            await backfill_history(chat, context)
-
-    except Exception as e:
-        logger.error(f"New chat error: {e}", exc_info=True)
-
-async def handle_react_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the /react command"""
-    try:
-        chat = update.effective_chat
-        if not chat:
-            logger.error("No chat found in update")
-            return
-            
-        if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
-            await update.message.reply_text("This command only works in group chats!")
-            return
-            
-        logger.info(f"Processing /react command in chat: {chat.title}")
-        
-        # Get recent messages
-        recent_messages = await get_recent_messages(chat.title)
-        
-        # Get GPT analysis
-        response = await analyze_with_gpt(recent_messages)
-        await update.message.reply_text(response)
-        
-    except Exception as e:
-        logger.error(f"React command error: {e}", exc_info=True)
-        await update.message.reply_text("Sorry, I had trouble analyzing the recent messages.")
 
 async def post_init(application: Application):
     """Backfill history for all known groups on startup"""
