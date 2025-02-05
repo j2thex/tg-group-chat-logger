@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, Chat
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,6 +15,7 @@ from telegram.ext import (
     filters
 )
 from openai import OpenAI
+import requests  # Add this import
 
 # Initialize logging with sensitive data protection
 class SensitiveFormatter(logging.Formatter):
@@ -62,6 +64,9 @@ BOT_START_TIME = datetime.now()
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+# Add Ollama endpoint constant
+OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
 
 def get_bot_token():
     """Get bot token from environment with detailed error handling"""
@@ -256,11 +261,11 @@ Keep your response concise and conversational, as if you're another member of th
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a friendly chat participant who provides brief, insightful observations about conversations."},
+                {"role": "system", "content": "You are a mean bot who roasts chat participants directly."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=150,
-            temperature=0.7
+            temperature=0.9
         )
 
         return response.choices[0].message.content.strip()
@@ -268,6 +273,77 @@ Keep your response concise and conversational, as if you're another member of th
     except Exception as e:
         logger.error(f"GPT analysis error: {e}", exc_info=True)
         return "I had some trouble analyzing the recent messages."
+
+async def analyze_with_ollama(messages: list) -> str:
+    """Roast conversation participants using Ollama with a roasting tone"""
+    try:
+        if not messages:
+            return "There aren't any recent messages to roast."
+
+        # Take only the last 5 unique messages to avoid repetition
+        seen_contents = set()
+        unique_messages = []
+        for msg in reversed(messages):  # Process from newest to oldest
+            if msg['content'] not in seen_contents:
+                seen_contents.add(msg['content'])
+                unique_messages.append(msg)
+            if len(unique_messages) >= 5:  # Limit to 5 messages
+                break
+        
+        formatted_chat = "\n".join([
+            f"{msg['username']}: {msg['content']}" 
+            for msg in reversed(unique_messages)  # Reverse back to chronological order
+        ])
+
+        prompt = f"""You are RoastBot3000, the meanest roast bot ever created.
+
+CONTEXT:
+{formatted_chat}
+
+RULES:
+1. Give exactly ONE brutal roast
+2. Maximum 10 words
+3. Be absolutely savage and ruthless
+4. NO COMPASSION OR KINDNESS ALLOWED
+5. NO ADVICE OR SUGGESTIONS
+6. NO EXPLANATIONS OR PREFIXES
+7. NO QUOTES OR PUNCTUATION EXCEPT PERIOD
+8. RESPOND IN ENGLISH ONLY
+
+FORMAT:
+- Do not use quotation marks
+- Do not use any prefixes like "Roast:" or "Here's a roast:"
+- Just write the roast directly
+- End with a period if needed
+
+BAD RESPONSES:
+"Your code is worse than your life choices"
+Here's your roast: You code like a sleepy toddler
+I think that your debugging skills need work
+
+GOOD RESPONSES:
+Name, Your look like a bum.
+Stupid and ugly people should be banned from this chat.
+Name,why all your messages sound like drunk texts?
+
+GIVE ONE BRUTAL ROAST ONLY. NO OTHER TEXT."""
+
+        response = requests.post(OLLAMA_ENDPOINT, json={
+            "model": "llama3",
+            "prompt": prompt,
+            "stream": False,
+            "temperature": 0.9
+        })
+        
+        if response.status_code == 200:
+            return response.json()['response'].strip().strip('"').strip()  # Added extra strip for quotes
+        else:
+            logger.error(f"Ollama API error: {response.status_code} - {response.text}")
+            return "I had some trouble roasting the conversation. Maybe it was too boring? 😏"
+
+    except Exception as e:
+        logger.error(f"Message analysis error: {e}", exc_info=True)
+        return "I had some trouble roasting the messages. Must have been too spicy for me! 🌶️"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle new messages including media"""
@@ -403,6 +479,18 @@ async def post_init(application: Application):
     except Exception as e:
         logger.error(f"Startup backfill error: {e}", exc_info=True)
 
+async def roast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for the /roast command"""
+    chat = update.effective_chat
+    
+    # Get recent messages for this chat
+    messages = await get_recent_messages(chat.title)
+    
+    await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+    response = await analyze_with_ollama(messages)
+    
+    await update.message.reply_text(response)
+
 def main():
     """Start the bot"""
     try:
@@ -427,11 +515,12 @@ def main():
         application.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
         application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
         application.add_handler(CommandHandler("react", handle_react_command))
+        application.add_handler(CommandHandler("roast", roast))
 
         logger.info("Bot initialized, starting polling...")
         
-        # Run the bot with proper shutdown handling
-        application.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+        # Run the bot with proper async handling
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except KeyboardInterrupt:
         logger.info("Bot stopping...")
