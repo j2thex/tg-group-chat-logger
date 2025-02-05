@@ -1,6 +1,31 @@
 import os
 import re
 import logging
+from functools import partial
+from typing import Any
+class SensitiveFormatter(logging.Formatter):
+    """Custom formatter that redacts sensitive information"""
+    
+    def __init__(self, fmt: str, *args: Any, **kwargs: Any):
+        super().__init__(fmt, *args, **kwargs)
+        self.sensitive_patterns = [
+            (re.compile(r'bot\d+:[A-Za-z0-9-_]{35}'), 'BOT_TOKEN_REDACTED'),
+            (re.compile(r'sk-[A-Za-z0-9]{48}'), 'OPENAI_KEY_REDACTED'),
+        ]
+
+    def format(self, record: logging.LogRecord) -> str:
+        if isinstance(record.msg, str):
+            msg = record.msg
+            for pattern, replacement in self.sensitive_patterns:
+                msg = pattern.sub(replacement, msg)
+            record.msg = msg
+        return super().format(record)
+
+# Initialize logging with sensitive data protection
+log_formatter = SensitiveFormatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -15,16 +40,26 @@ from telegram.ext import (
 )
 from openai import OpenAI
 
-# Initialize logging first
+# File handler
+file_handler = logging.FileHandler("bot.log")
+file_handler.setFormatter(log_formatter)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+
+# Configure root logger
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[file_handler, console_handler]
 )
+
 logger = logging.getLogger(__name__)
+
+httpx_logger = logging.getLogger('httpx')
+for handler in httpx_logger.handlers:
+    handler.setFormatter(log_formatter)
+
 
 # Set up base directory and load environment variables
 BASE_DIR = Path(__file__).resolve().parent
