@@ -261,11 +261,11 @@ Keep your response concise and conversational, as if you're another member of th
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a mean bot who roasts chat participants directly."},
+                {"role": "system", "content": "You are a mean bot who swears and roasts chat participants directly."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=150,
-            temperature=0.9
+            max_tokens=100,
+            temperature=0.7
         )
 
         return response.choices[0].message.content.strip()
@@ -283,10 +283,18 @@ async def analyze_with_ollama(messages: list) -> str:
         # Take only the last 5 unique messages to avoid repetition
         seen_contents = set()
         unique_messages = []
+        MAX_MESSAGE_LENGTH = 200  # Limit each message to 200 characters
+        
         for msg in reversed(messages):  # Process from newest to oldest
-            if msg['content'] not in seen_contents:
-                seen_contents.add(msg['content'])
-                unique_messages.append(msg)
+            # Truncate long messages
+            content = msg['content'][:MAX_MESSAGE_LENGTH] + "..." if len(msg['content']) > MAX_MESSAGE_LENGTH else msg['content']
+            
+            if content not in seen_contents:
+                seen_contents.add(content)
+                unique_messages.append({
+                    'username': msg['username'],
+                    'content': content
+                })
             if len(unique_messages) >= 5:  # Limit to 5 messages
                 break
         
@@ -294,6 +302,11 @@ async def analyze_with_ollama(messages: list) -> str:
             f"{msg['username']}: {msg['content']}" 
             for msg in reversed(unique_messages)  # Reverse back to chronological order
         ])
+
+        # Limit total context length
+        MAX_CONTEXT_LENGTH = 1000  # Total context limit
+        if len(formatted_chat) > MAX_CONTEXT_LENGTH:
+            formatted_chat = formatted_chat[-MAX_CONTEXT_LENGTH:]
 
         prompt = f"""You are RoastBot3000, the meanest roast bot ever created.
 
@@ -317,16 +330,24 @@ FORMAT:
 - End with a period if needed
 
 BAD RESPONSES:
-"Your code is worse than your life choices"
-Here's your roast: You code like a sleepy toddler
-I think that your debugging skills need work
+"You are worse than your life choices"
+Here's your roast: You are a sleepy toddler
+I think that your skills need work
 
 GOOD RESPONSES:
-Name, You look like a bum.
+You look like a bum.
 Stupid and ugly people should be banned from this chat.
-Name, why all your messages sound like drunk texts?
+why all your messages sound like drunk texts?
+This groupchat is shit.
+Fuck you. 
 
-GIVE ONE BRUTAL ROAST ONLY. NO OTHER TEXT."""
+GIVE ONE BRUTAL ROAST ONLY FROM CONTEXT. NO OTHER TEXT."""
+
+        # Log the prompt
+        logger.info("Sending prompt to LLM:")
+        logger.info("-" * 50)
+        logger.info(prompt)
+        logger.info("-" * 50)
 
         response = requests.post(OLLAMA_ENDPOINT, json={
             "model": "llama3",
@@ -336,7 +357,13 @@ GIVE ONE BRUTAL ROAST ONLY. NO OTHER TEXT."""
         })
         
         if response.status_code == 200:
-            return response.json()['response'].strip().strip('"').strip()  # Added extra strip for quotes
+            result = response.json()['response'].strip().strip('"').strip()
+            # Log the response
+            logger.info("LLM Response:")
+            logger.info("-" * 50)
+            logger.info(result)
+            logger.info("-" * 50)
+            return result
         else:
             logger.error(f"Ollama API error: {response.status_code} - {response.text}")
             return "I had some trouble roasting the conversation. Maybe it was too boring? 😏"
