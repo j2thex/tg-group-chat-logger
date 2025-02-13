@@ -16,6 +16,7 @@ from telegram.ext import (
 )
 from openai import OpenAI
 import requests  # Add this import
+import logging.handlers
 
 # Initialize logging with sensitive data protection
 class SensitiveFormatter(logging.Formatter):
@@ -48,6 +49,13 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# Add new logger setup at the top of the file with other logger definitions
+llm_logger = logging.getLogger('llm_logger')
+llm_logger.setLevel(logging.INFO)
+llm_handler = logging.FileHandler('llm.log')
+llm_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+llm_logger.addHandler(llm_handler)
 
 # Set up base directory and load environment variables
 BASE_DIR = Path(__file__).resolve().parent
@@ -265,7 +273,7 @@ Keep your response concise and conversational, as if you're another member of th
                 {"role": "user", "content": prompt}
             ],
             max_tokens=100,
-            temperature=0.7
+            temperature=0.2
         )
 
         return response.choices[0].message.content.strip()
@@ -311,58 +319,57 @@ async def analyze_with_ollama(messages: list) -> str:
         prompt = f"""You are RoastBot3000, the meanest roast bot ever created.
 
 CONTEXT:
+Name, Message
 {formatted_chat}
 
 RULES:
-1. Give exactly ONE brutal roast
-2. Maximum 10 words
-3. Be absolutely savage and ruthless
-4. NO COMPASSION OR KINDNESS ALLOWED
-5. NO ADVICE OR SUGGESTIONS
-6. NO EXPLANATIONS OR PREFIXES
-7. NO QUOTES OR PUNCTUATION EXCEPT PERIOD
-8. RESPOND IN ENGLISH ONLY
+Pick a random name from the context to address your roast.
+Deliver ONE brutal roast.
+Maximum 10 words.
+Be savage, ruthless, and absolutely merciless.
+NO compassion, kindness, advice, or suggestions.
+NO explanations, prefixes, or filler text.
+Respond ONLY IN RUSSIAN.
 
 FORMAT:
-- Do not use quotation marks
-- Do not use any prefixes like "Roast:" or "Here's a roast:"
-- Just write the roast directly
-- End with a period if needed
+Write the roast directly without quotation marks or prefixes like "Roast:" or "Here's a roast:".
+End with a period if needed.
+Keep it short, sharp, and devastating.
 
 BAD RESPONSES:
-"You are worse than your life choices"
-Here's your roast: You are a sleepy toddler
-I think that your skills need work
+"You are worse than your life choices."
+Here's your roast: You are a sleepy toddler.
+I think that your skills need work.
 
 GOOD RESPONSES:
-You look like a bum.
-Stupid and ugly people should be banned from this chat.
-why all your messages sound like drunk texts?
-This groupchat is shit.
-Fuck you. 
+Ты выглядишь как бомж.
+Тупые и уродливые люди должны быть забанены.
+Почему твои сообщения звучат как пьяный бред?
+Этот чат — дерьмо.
+Иди нахуй.
 
-GIVE ONE BRUTAL ROAST ONLY FROM CONTEXT. NO OTHER TEXT."""
+ADDRESS BY NAME ANY PERSON FROM CONTEXT, GIVE ONE BRUTAL ROAST FROM CONTEXT. NO OTHER TEXT."""
 
-        # Log the prompt
-        logger.info("Sending prompt to LLM:")
-        logger.info("-" * 50)
-        logger.info(prompt)
-        logger.info("-" * 50)
+        # Log the prompt to llm.log
+        llm_logger.info("Sending prompt to LLM:")
+        llm_logger.info("-" * 50)
+        llm_logger.info(prompt)
+        llm_logger.info("-" * 50)
 
         response = requests.post(OLLAMA_ENDPOINT, json={
-            "model": "llama3",
+            "model": "wizardlm-uncensored",
             "prompt": prompt,
             "stream": False,
-            "temperature": 0.9
+            "temperature": 0.2
         })
         
         if response.status_code == 200:
             result = response.json()['response'].strip().strip('"').strip()
-            # Log the response
-            logger.info("LLM Response:")
-            logger.info("-" * 50)
-            logger.info(result)
-            logger.info("-" * 50)
+            # Log the response to llm.log
+            llm_logger.info("LLM Response:")
+            llm_logger.info("-" * 50)
+            llm_logger.info(result)
+            llm_logger.info("-" * 50)
             return result
         else:
             logger.error(f"Ollama API error: {response.status_code} - {response.text}")
